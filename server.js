@@ -32,41 +32,60 @@ app.get('/', (req, res) => {
 app.get('/funding', async (req, res) => {
   const { pair } = req.query;
   try {
-    // Price
+    // Price from ticker
     const tickerRes = await fetch('https://public.coindcx.com/exchange/ticker');
     const tickers = await tickerRes.json();
     const ticker = tickers.find(t => t.market === pair);
 
-    // Funding Rate
-    const frRes = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`);
-    let fundingData = {};
-    if(frRes.ok) fundingData = await frRes.json();
+    // Funding Rate from CoinDCX futures
+    let fundingRate = 0.0091;
+    let countdownSeconds = null;
 
-    // Countdown calculate
-    const now = new Date();
-    const utcH = now.getUTCHours();
-    const utcM = now.getUTCMinutes();
-    const utcS = now.getUTCSeconds();
-    const totalSecs = utcH * 3600 + utcM * 60 + utcS;
-    const cycles = [0, 8*3600, 16*3600, 24*3600];
-    let secsLeft = 0;
-    for(let c of cycles) {
-      if(c > totalSecs) { secsLeft = c - totalSecs; break; }
+    try {
+      const frRes = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`);
+      if(frRes.ok) {
+        const fd = await frRes.json();
+        if(fd.funding_rate) fundingRate = parseFloat(fd.funding_rate);
+        if(fd.next_funding_time) {
+          const ms = new Date(fd.next_funding_time).getTime() - Date.now();
+          if(ms > 0) countdownSeconds = Math.floor(ms / 1000);
+        }
+      }
+    } catch(e) {}
+
+    // Try futures ticker for funding info
+    if(!countdownSeconds) {
+      try {
+        const ftRes = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers');
+        if(ftRes.ok) {
+          const ftData = await ftRes.json();
+          const ft = ftData.find(t => t.symbol === pair || t.market === pair);
+          if(ft && ft.next_funding_time) {
+            const ms = new Date(ft.next_funding_time).getTime() - Date.now();
+            if(ms > 0) countdownSeconds = Math.floor(ms / 1000);
+          }
+          if(ft && ft.funding_rate) fundingRate = parseFloat(ft.funding_rate);
+        }
+      } catch(e) {}
     }
-    if(secsLeft === 0) secsLeft = 24*3600 - totalSecs;
 
-    // Exact time from API if available
-    if(fundingData.next_funding_time) {
-      const ms = new Date(fundingData.next_funding_time).getTime() - Date.now();
-      if(ms > 0) secsLeft = Math.floor(ms/1000);
+    // Fallback: 8-hour UTC cycle
+    if(!countdownSeconds) {
+      const now = new Date();
+      const utcH = now.getUTCHours(), utcM = now.getUTCMinutes(), utcS = now.getUTCSeconds();
+      const totalSecs = utcH * 3600 + utcM * 60 + utcS;
+      const cycles = [0, 8*3600, 16*3600, 24*3600];
+      let secsLeft = 0;
+      for(let c of cycles) { if(c > totalSecs) { secsLeft = c - totalSecs; break; } }
+      if(secsLeft === 0) secsLeft = 24*3600 - totalSecs;
+      countdownSeconds = secsLeft;
     }
 
     res.json({
       success: true,
       price: ticker ? ticker.last_price : null,
-      funding_rate: fundingData.funding_rate || 0.0091,
-      countdown_seconds: secsLeft,
-      next_funding_time: fundingData.next_funding_time || null
+      funding_rate: fundingRate,
+      countdown_seconds: countdownSeconds
     });
   } catch(e) {
     res.status(500).json({ success: false, error: e.message });
