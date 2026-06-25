@@ -12,226 +12,202 @@ app.use(express.json());
 // HEALTH CHECK
 // ══════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.json({ status: 'Param Beer Shakti Bot ✅', time: new Date().toISOString() });
+  res.json({ status: 'Param Beer Shakti Multi-Exchange Bot ✅', time: new Date().toISOString() });
 });
 
 // ══════════════════════════════════════════
-// FUNDING RATE — REAL DATA
+// COINDCX — FUNDING + SCAN
 // ══════════════════════════════════════════
 app.get('/funding', async (req, res) => {
   const { pair } = req.query;
-  if(!pair) return res.status(400).json({ success: false, error: 'pair required' });
+  let price = null, fundingRate = null, countdown = null;
 
-  let price = null;
-  let fundingRate = null;
-  let countdown = null;
-
-  // Step 1: Get price from public ticker
   try {
-    const r = await fetch('https://public.coindcx.com/exchange/ticker', {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
+    const r = await fetch('https://public.coindcx.com/exchange/ticker');
     const d = await r.json();
     const t = d.find(x => x.market === pair);
     if(t) price = t.last_price;
   } catch(e) {}
 
-  // Step 2: Get real funding rate from CoinDCX futures
   try {
-    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-    });
+    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`);
     if(r.ok) {
       const d = await r.json();
-      console.log(`Funding API response for ${pair}:`, JSON.stringify(d));
-      if(d.funding_rate !== undefined && d.funding_rate !== null) {
-        fundingRate = parseFloat(d.funding_rate);
-      }
+      if(d.funding_rate !== undefined) fundingRate = parseFloat(d.funding_rate);
       if(d.next_funding_time) {
         const ms = new Date(d.next_funding_time).getTime() - Date.now();
         if(ms > 0) countdown = Math.floor(ms / 1000);
       }
     }
-  } catch(e) {
-    console.log('Funding rate API error:', e.message);
+  } catch(e) {}
+
+  if(!countdown) {
+    const now = new Date();
+    const s = now.getUTCHours()*3600 + now.getUTCMinutes()*60 + now.getUTCSeconds();
+    const c = [0, 8*3600, 16*3600, 24*3600];
+    let left = 0;
+    for(let x of c) { if(x > s) { left = x - s; break; } }
+    if(left === 0) left = 24*3600 - s;
+    countdown = left;
   }
 
-  // Step 3: Try futures market ticker
-  if(fundingRate === null) {
-    try {
-      const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      if(r.ok) {
-        const d = await r.json();
-        console.log('Futures tickers sample:', JSON.stringify(d.slice ? d.slice(0,2) : d));
-        const ticker = Array.isArray(d) ? d.find(t => t.symbol === pair || t.market === pair) : null;
-        if(ticker) {
-          if(ticker.funding_rate !== undefined) fundingRate = parseFloat(ticker.funding_rate);
-          if(ticker.next_funding_time) {
-            const ms = new Date(ticker.next_funding_time).getTime() - Date.now();
-            if(ms > 0) countdown = Math.floor(ms / 1000);
-          }
-        }
+  res.json({ success: true, price, funding_rate: fundingRate, countdown_seconds: countdown });
+});
+
+app.get('/scan', async (req, res) => {
+  const ex = req.query.ex || 'coindcx';
+
+  if(ex === 'delta') {
+    return await scanDelta(res);
+  }
+  if(ex === 'mudrex') {
+    return await scanMudrex(res);
+  }
+
+  // CoinDCX scan
+  let results = [];
+  try {
+    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers');
+    if(r.ok) {
+      const d = await r.json();
+      if(Array.isArray(d) && d.length > 0) {
+        results = d.filter(t => (t.symbol||t.market||'').includes('USDT') && t.funding_rate !== undefined && t.funding_rate !== null)
+          .map(t => ({ symbol: (t.symbol||t.market||'').replace('B-','').replace('_USDT',''), pair: t.symbol||t.market, funding_rate: parseFloat(t.funding_rate) }));
       }
-    } catch(e) {
-      console.log('Futures tickers error:', e.message);
     }
-  }
+  } catch(e) {}
 
-  // Step 4: Try market details
-  if(fundingRate === null) {
+  if(results.length === 0) {
     try {
-      const r = await fetch('https://api.coindcx.com/exchange/v1/markets_details', {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      if(r.ok) {
-        const d = await r.json();
-        const m = d.find(x => x.symbol === pair);
-        if(m) {
-          console.log(`Market details for ${pair}:`, JSON.stringify(m));
-          for(const f of ['funding_rate','current_funding_rate','last_funding_rate']) {
-            if(m[f] !== undefined && m[f] !== null) {
-              fundingRate = parseFloat(m[f]);
-              break;
-            }
-          }
-        }
-      }
+      const r = await fetch('https://api.coindcx.com/exchange/v1/markets_details');
+      const d = await r.json();
+      results = d.filter(m => m.symbol?.startsWith('B-') && m.symbol?.endsWith('_USDT') && m.status==='active' && m.funding_rate !== undefined)
+        .map(m => ({ symbol: m.base_currency_short_name || m.symbol.replace('B-','').replace('_USDT',''), pair: m.symbol, funding_rate: parseFloat(m.funding_rate||0) }))
+        .filter(m => m.funding_rate !== 0);
     } catch(e) {}
   }
 
-  // Fallback countdown
-  if(!countdown) {
-    const now = new Date();
-    const utcSecs = now.getUTCHours()*3600 + now.getUTCMinutes()*60 + now.getUTCSeconds();
-    const cycles = [0, 8*3600, 16*3600, 24*3600];
-    let secsLeft = 0;
-    for(let c of cycles) { if(c > utcSecs) { secsLeft = c - utcSecs; break; } }
-    if(secsLeft === 0) secsLeft = 24*3600 - utcSecs;
-    countdown = secsLeft;
-  }
-
-  res.json({
-    success: true,
-    price,
-    funding_rate: fundingRate,
-    countdown_seconds: countdown,
-    note: fundingRate === null ? 'funding_rate not available from API' : 'live'
-  });
+  res.json({ success: true, exchange: 'coindcx', count: results.length, results });
 });
 
 // ══════════════════════════════════════════
-// ALL FUNDING RATES — SCANNER
+// DELTA EXCHANGE — SCAN (REAL API)
 // ══════════════════════════════════════════
-app.get('/scan', async (req, res) => {
+async function scanDelta(res) {
   try {
-    let results = [];
+    // Delta India — Get all perpetual futures tickers with funding rate
+    const r = await fetch('https://api.india.delta.exchange/v2/tickers?contract_types=perpetual_futures', {
+      headers: { 'Accept': 'application/json' }
+    });
+    if(r.ok) {
+      const d = await r.json();
+      if(d.success && d.result) {
+        const results = d.result
+          .filter(t => t.funding_rate !== undefined && t.funding_rate !== null && t.contract_type === 'perpetual_futures')
+          .map(t => ({
+            symbol: t.underlying_asset_symbol || t.symbol?.replace('USDT','') || '',
+            pair: t.symbol,
+            product_id: t.product_id,
+            funding_rate: parseFloat(t.funding_rate),
+            price: t.mark_price || t.close || null
+          }))
+          .filter(t => t.symbol && Math.abs(t.funding_rate) > 0);
 
-    // Try to get all funding rates at once
-    try {
-      const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      if(r.ok) {
-        const d = await r.json();
-        console.log('Scan tickers count:', d.length, 'Sample:', JSON.stringify(d[0]));
-        if(Array.isArray(d)) {
-          results = d
-            .filter(t => (t.symbol || t.market || '').includes('USDT'))
-            .map(t => ({
-              symbol: (t.symbol || t.market || '').replace('B-','').replace('_USDT',''),
-              pair: t.symbol || t.market,
-              funding_rate: t.funding_rate !== undefined ? parseFloat(t.funding_rate) : null,
-              price: t.last_price || t.mark_price || null,
-              next_funding_time: t.next_funding_time || null
-            }))
-            .filter(t => t.funding_rate !== null && t.symbol);
-        }
+        return res.json({ success: true, exchange: 'delta', count: results.length, results });
       }
-    } catch(e) {
-      console.log('Scan error:', e.message);
     }
-
-    // Try markets details for funding rates
-    if(results.length === 0) {
-      try {
-        const r = await fetch('https://api.coindcx.com/exchange/v1/markets_details', {
-          headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        if(r.ok) {
-          const d = await r.json();
-          const futures = d.filter(m => m.symbol && m.symbol.startsWith('B-') && m.symbol.endsWith('_USDT') && m.status === 'active');
-          console.log('Markets count:', futures.length, 'Sample:', JSON.stringify(futures[0]));
-          results = futures.map(m => ({
-            symbol: m.base_currency_short_name || m.symbol.replace('B-','').replace('_USDT',''),
-            pair: m.symbol,
-            funding_rate: m.funding_rate !== undefined ? parseFloat(m.funding_rate) :
-                         m.current_funding_rate !== undefined ? parseFloat(m.current_funding_rate) : null,
-            price: m.last_price || null
-          })).filter(t => t.funding_rate !== null);
-        }
-      } catch(e) {}
-    }
-
-    res.json({ success: true, count: results.length, results });
+    return res.json({ success: false, exchange: 'delta', error: 'No data from Delta API' });
   } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
   }
-});
+}
 
 // ══════════════════════════════════════════
-// PLACE ORDER
+// COINDCX — PLACE ORDER
 // ══════════════════════════════════════════
 app.post('/order/place', async (req, res) => {
   const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
-  if(!apiKey || !apiSecret || !pair || !side || !quantity) {
-    return res.status(400).json({ success: false, error: 'Missing fields' });
-  }
+  if(!apiKey||!apiSecret||!pair||!side||!quantity) return res.status(400).json({ success: false, error: 'Missing fields' });
   try {
     const timestamp = Date.now();
-    const body = JSON.stringify({ market: pair, order_type: 'market_order', side, quantity, leverage: leverage || 1, timestamp });
+    const body = JSON.stringify({ market: pair, order_type: 'market_order', side, quantity, leverage: leverage||1, timestamp });
     const signature = crypto.createHmac('sha256', apiSecret).update(body).digest('hex');
-    const response = await fetch('https://api.coindcx.com/exchange/v1/derivatives/orders', {
+    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/orders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AUTH-APIKEY': apiKey, 'X-AUTH-SIGNATURE': signature },
       body
     });
-    const data = await response.json();
-    if(response.ok) {
-      res.json({ success: true, orderId: data.id, price: data.price_per_unit, data });
-    } else {
-      res.json({ success: false, error: data.message || 'Order failed', data });
-    }
-  } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+    const data = await r.json();
+    if(r.ok) res.json({ success: true, orderId: data.id, data });
+    else res.json({ success: false, error: data.message||'Order failed', data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/order/close', async (req, res) => {
+  const closeSide = req.body.side === 'buy' ? 'sell' : 'buy';
+  req.body.side = closeSide;
+  const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
+  try {
+    const timestamp = Date.now();
+    const body = JSON.stringify({ market: pair, order_type: 'market_order', side, quantity, leverage: leverage||1, timestamp });
+    const signature = crypto.createHmac('sha256', apiSecret).update(body).digest('hex');
+    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AUTH-APIKEY': apiKey, 'X-AUTH-SIGNATURE': signature },
+      body
+    });
+    const data = await r.json();
+    if(r.ok) res.json({ success: true, orderId: data.id, data });
+    else res.json({ success: false, error: data.message||'Close failed', data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ══════════════════════════════════════════
-// CLOSE ORDER
+// DELTA EXCHANGE — PLACE ORDER (REAL API)
 // ══════════════════════════════════════════
-app.post('/order/close', async (req, res) => {
-  const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
-  const closeSide = side === 'buy' ? 'sell' : 'buy';
+function deltaSign(secret, method, timestamp, path, body='') {
+  const msg = method + timestamp + path + body;
+  return crypto.createHmac('sha256', secret).update(msg).digest('hex');
+}
+
+app.post('/order/place/delta', async (req, res) => {
+  const { apiKey, apiSecret, pair, side, quantity, leverage, product_id } = req.body;
+  if(!apiKey||!apiSecret) return res.status(400).json({ success: false, error: 'Missing API keys' });
   try {
-    const timestamp = Date.now();
-    const body = JSON.stringify({ market: pair, order_type: 'market_order', side: closeSide, quantity, leverage: leverage || 1, timestamp });
-    const signature = crypto.createHmac('sha256', apiSecret).update(body).digest('hex');
-    const response = await fetch('https://api.coindcx.com/exchange/v1/derivatives/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-AUTH-APIKEY': apiKey, 'X-AUTH-SIGNATURE': signature },
-      body
-    });
-    const data = await response.json();
-    if(response.ok) {
-      res.json({ success: true, orderId: data.id, data });
-    } else {
-      res.json({ success: false, error: data.message || 'Close failed', data });
+    // Get product_id if not provided
+    let pid = product_id;
+    if(!pid) {
+      const tr = await fetch(`https://api.india.delta.exchange/v2/tickers?contract_types=perpetual_futures`);
+      const td = await tr.json();
+      const ticker = td.result?.find(t => t.symbol === pair || t.underlying_asset_symbol === pair?.replace('B-','').replace('_USDT',''));
+      if(!ticker) return res.json({ success: false, error: `Product not found for ${pair}` });
+      pid = ticker.product_id;
     }
-  } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const path = '/v2/orders';
+    const bodyObj = { product_id: pid, size: Math.floor(quantity), side: side === 'buy' ? 'buy' : 'sell', order_type: 'market_order', leverage: String(leverage||1) };
+    const bodyStr = JSON.stringify(bodyObj);
+    const signature = deltaSign(apiSecret, 'POST', timestamp, path, bodyStr);
+
+    const r = await fetch(`https://api.india.delta.exchange${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'api-key': apiKey, 'timestamp': timestamp, 'signature': signature },
+      body: bodyStr
+    });
+    const data = await r.json();
+    if(data.success) res.json({ success: true, orderId: data.result?.id, data });
+    else res.json({ success: false, error: data.error?.message || data.error || 'Delta order failed', data });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/order/close/delta', async (req, res) => {
+  req.body.side = req.body.side === 'buy' ? 'sell' : 'buy';
+  // Forward to place
+  const r = await fetch(`http://localhost:${process.env.PORT||3000}/order/place/delta`, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(req.body)
+  });
+  res.json(await r.json());
 });
 
 // ══════════════════════════════════════════
@@ -241,19 +217,87 @@ app.get('/coins', async (req, res) => {
   try {
     const r = await fetch('https://api.coindcx.com/exchange/v1/markets_details');
     const data = await r.json();
-    const coins = data
-      .filter(m => m.symbol && m.symbol.startsWith('B-') && m.symbol.endsWith('_USDT') && m.status === 'active')
-      .map(m => ({
-        symbol: m.base_currency_short_name || m.symbol.replace('B-','').replace('_USDT',''),
-        name: m.base_currency_name || '',
-        pair: m.symbol,
-        max_leverage: m.max_leverage || m.leverage || null
-      }));
+    const coins = data.filter(m => m.symbol?.startsWith('B-') && m.symbol?.endsWith('_USDT') && m.status==='active')
+      .map(m => ({ symbol: m.base_currency_short_name||m.symbol.replace('B-','').replace('_USDT',''), name: m.base_currency_name||'', pair: m.symbol, max_leverage: m.max_leverage||m.leverage||null }));
     res.json({ success: true, coins });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+
+// ══════════════════════════════════════════
+// MUDREX — SCAN (REAL API)
+// ══════════════════════════════════════════
+async function scanMudrex(res) {
+  try {
+    // Mudrex public funding rate endpoint
+    const r = await fetch('https://trade.mudrex.com/fapi/v1/premiumIndex', {
+      headers: { 'Accept': 'application/json' }
+    });
+    if(r.ok) {
+      const d = await r.json();
+      if(Array.isArray(d)) {
+        const results = d
+          .filter(t => t.symbol && t.lastFundingRate !== undefined)
+          .map(t => ({
+            symbol: t.symbol.replace('USDT','').replace('BUSD',''),
+            pair: t.symbol,
+            funding_rate: parseFloat(t.lastFundingRate),
+            price: t.markPrice || null,
+            next_funding_time: t.nextFundingTime || null
+          }))
+          .filter(t => t.symbol && Math.abs(t.funding_rate) > 0);
+        return res.json({ success: true, exchange: 'mudrex', count: results.length, results });
+      }
+    }
+    return res.json({ success: false, exchange: 'mudrex', error: 'No data from Mudrex API' });
   } catch(e) {
-    res.status(500).json({ success: false, error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
   }
+}
+
+// ══════════════════════════════════════════
+// MUDREX — PLACE ORDER (REAL API)
+// ══════════════════════════════════════════
+app.post('/order/place/mudrex', async (req, res) => {
+  const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
+  if(!apiKey||!apiSecret) return res.status(400).json({ success: false, error: 'Missing API keys' });
+  try {
+    // Mudrex uses X-Authentication header with API secret
+    // First set leverage
+    await fetch('https://trade.mudrex.com/fapi/v1/leverage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Authentication': apiSecret },
+      body: JSON.stringify({ symbol: pair, leverage: leverage||10 })
+    });
+
+    // Place market order
+    const bodyObj = {
+      symbol: pair,
+      side: side.toUpperCase(), // BUY or SELL
+      type: 'MARKET',
+      quantity: String(quantity)
+    };
+    const r = await fetch('https://trade.mudrex.com/fapi/v1/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Authentication': apiSecret },
+      body: JSON.stringify(bodyObj)
+    });
+    const data = await r.json();
+    if(r.ok && (data.orderId || data.order_id)) {
+      res.json({ success: true, orderId: data.orderId||data.order_id, data });
+    } else {
+      res.json({ success: false, error: data.msg || data.message || 'Mudrex order failed', data });
+    }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/order/close/mudrex', async (req, res) => {
+  req.body.side = req.body.side === 'buy' ? 'sell' : 'buy';
+  const r = await fetch(`http://localhost:${process.env.PORT||3000}/order/place/mudrex`, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(req.body)
+  });
+  res.json(await r.json());
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Multi-Exchange Server running on port ${PORT}`));
