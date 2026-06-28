@@ -1,10 +1,11 @@
 {
   "name": "parambeer-funding-bot",
   "version": "1.0.0",
-  "description": "Param Beer Shakti CoinDCX Funding Bot Server",
+  "description": "Param Beer Shakti CoinDCX Funding Bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "engines": {
     "node": ">=18.0.0"
