@@ -109,31 +109,74 @@ app.post('/bot/stop', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// FUNDING TIME FETCH
+// FUNDING TIME FETCH — Coin specific
 // ══════════════════════════════════════════
 async function fetchFundingCountdown(pair) {
-  // Method 1: CoinDCX API
+  console.log(`Fetching funding time for pair: ${pair}`);
+
+  // Method 1: CoinDCX exact funding API
   try {
-    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`);
+    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+    });
     if(r.ok) {
       const d = await r.json();
+      console.log('Funding API response:', JSON.stringify(d));
+      if(d.funding_rate !== undefined) botState.fundingRate = parseFloat(d.funding_rate);
       if(d.next_funding_time) {
         const ms = new Date(d.next_funding_time).getTime() - Date.now();
         if(ms > 0) {
-          if(d.funding_rate) botState.fundingRate = parseFloat(d.funding_rate);
+          console.log(`✅ Live countdown from API: ${Math.floor(ms/1000)} seconds`);
           return Math.floor(ms / 1000);
         }
       }
     }
+  } catch(e) { console.log('Method 1 failed:', e.message); }
+
+  // Method 2: Futures tickers
+  try {
+    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    if(r.ok) {
+      const d = await r.json();
+      const ticker = Array.isArray(d) ? d.find(t => t.symbol === pair || t.market === pair) : null;
+      console.log('Ticker found:', JSON.stringify(ticker));
+      if(ticker) {
+        if(ticker.funding_rate) botState.fundingRate = parseFloat(ticker.funding_rate);
+        if(ticker.next_funding_time) {
+          const ms = new Date(ticker.next_funding_time).getTime() - Date.now();
+          if(ms > 0) {
+            console.log(`✅ Live countdown from ticker: ${Math.floor(ms/1000)} seconds`);
+            return Math.floor(ms / 1000);
+          }
+        }
+      }
+    }
+  } catch(e) { console.log('Method 2 failed:', e.message); }
+
+  // Method 3: Public ticker
+  try {
+    const r = await fetch('https://public.coindcx.com/exchange/ticker');
+    if(r.ok) {
+      const d = await r.json();
+      const t = d.find(x => x.market === pair);
+      if(t && t.next_funding_time) {
+        const ms = new Date(t.next_funding_time).getTime() - Date.now();
+        if(ms > 0) return Math.floor(ms/1000);
+      }
+    }
   } catch(e) {}
 
-  // Method 2: UTC 8-hour cycle
+  // Fallback: UTC 8-hour cycle
+  console.log('Using UTC 8-hour fallback');
   const now = new Date();
   const s = now.getUTCHours()*3600 + now.getUTCMinutes()*60 + now.getUTCSeconds();
   const cycles = [0, 8*3600, 16*3600, 24*3600];
   let left = 0;
   for(let c of cycles) { if(c > s) { left = c - s; break; } }
   if(left === 0) left = 24*3600 - s;
+  console.log(`Fallback countdown: ${left} seconds`);
   return left;
 }
 
