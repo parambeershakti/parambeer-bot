@@ -737,9 +737,7 @@ app.get('/coins', async (req, res) => {
 // ══════════════════════════════════════════
 // START SERVER
 // ══════════════════════════════════════════
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Param Beer Shakti Bot Server running on port ${PORT}`);
-  console.log(`📡 Exchanges: CoinDCX | Delta Exchange | Mudrex`);
-  console.log(`🚀 Health: http://localhost:${PORT}/`);
+const path = require('path');
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'parambeer-funding-bot-14.html'));
 });
