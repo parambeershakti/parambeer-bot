@@ -2,12 +2,22 @@ const express = require('express');
 const crypto = require('crypto');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const cors = require('cors');
+const { createClient } = require('socket.io-client') || {};
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
 app.use(express.json());
 
+// ══════════════════════════════════════════
+// FUNDING CACHE — pair wise real time
+// ══════════════════════════════════════════
+let fundingData = {};
+// Structure: { 'B-BTC_USDT': { countdown: 12345, rate: 0.0091, updatedAt: Date.now() } }
+
+// ══════════════════════════════════════════
+// BOT STATE
+// ══════════════════════════════════════════
 let botState = {
   running: false,
   apiKey: '',
@@ -34,10 +44,14 @@ function addLog(msg, type='info') {
   console.log(`[${type}] ${msg}`);
 }
 
+// ══════════════════════════════════════════
+// HEALTH CHECK
+// ══════════════════════════════════════════
 app.get('/', (req, res) => {
   res.json({ 
     status: '✅ Param Beer Shakti Server Live!',
     botRunning: botState.running,
+    fundingPairs: Object.keys(fundingData).length,
     time: new Date().toISOString()
   });
 });
@@ -57,6 +71,9 @@ app.get('/bot/status', (req, res) => {
   });
 });
 
+// ══════════════════════════════════════════
+// BOT START / STOP
+// ══════════════════════════════════════════
 app.post('/bot/start', async (req, res) => {
   const { apiKey, apiSecret, pair, side, quantity, leverage, exchange } = req.body;
   if(!apiKey || !apiSecret || !pair || !side || !quantity) {
@@ -74,7 +91,7 @@ app.post('/bot/start', async (req, res) => {
   botState.exchange = exchange || 'coindcx';
   botState.running = true;
   botState.orderPlacedThisCycle = false;
-  addLog(`🟢 Server Bot Started! ${pair} | ${side.toUpperCase()} | ${exchange}`, 'info');
+  addLog(`🟢 Bot Started! ${pair} | ${side.toUpperCase()}`, 'info');
   startBotLoop();
   res.json({ success: true, message: 'Bot started!' });
 });
@@ -83,94 +100,95 @@ app.post('/bot/stop', (req, res) => {
   botState.running = false;
   if(botState.timer) { clearInterval(botState.timer); botState.timer = null; }
   addLog('⏹ Bot Stopped', 'info');
-  res.json({ success: true, message: 'Bot stopped' });
+  res.json({ success: true });
 });
 
+// ══════════════════════════════════════════
+// FUNDING TIME — IST cycle based (RELIABLE)
+// ══════════════════════════════════════════
+function getISTCountdown() {
+  // CoinDCX funding हर 8 घंटे: 00:00, 08:00, 16:00 IST
+  const now = new Date();
+  // IST = UTC + 5:30 = UTC + 19800 seconds
+  const utcSecs = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  const istSecs = (utcSecs + 19800) % 86400;
+  const cycles = [0, 8 * 3600, 16 * 3600, 24 * 3600];
+  let left = 0;
+  for(let c of cycles) {
+    if(c > istSecs) { left = c - istSecs; break; }
+  }
+  if(left === 0) left = 86400 - istSecs;
+  return left;
+}
+
 async function fetchFundingCountdown(pair) {
-  console.log(`Fetching funding time for: ${pair}`);
-
-  try {
-    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-    });
-    if(r.ok) {
-      const d = await r.json();
-      if(Array.isArray(d)) {
-        const ticker = d.find(t => 
-          t.symbol === pair || 
-          t.market === pair || 
-          t.symbol === pair.replace('B-','') ||
-          t.market === pair.replace('B-','')
-        );
-        console.log('Ticker:', JSON.stringify(ticker));
-        if(ticker) {
-          if(ticker.funding_rate) botState.fundingRate = parseFloat(ticker.funding_rate);
-          if(ticker.next_funding_time) {
-            let ms;
-            if(String(ticker.next_funding_time).length === 13) ms = ticker.next_funding_time - Date.now();
-            else if(String(ticker.next_funding_time).length === 10) ms = (ticker.next_funding_time * 1000) - Date.now();
-            else ms = new Date(ticker.next_funding_time).getTime() - Date.now();
-            if(ms > 0 && ms < 9 * 3600 * 1000) {
-              const secs = Math.floor(ms / 1000);
-              console.log(`✅ Live countdown: ${secs}s`);
-              return secs;
-            }
-          }
-        }
-      }
-    }
-  } catch(e) { console.log('Method 1 failed:', e.message); }
-
+  // Try CoinDCX API first
   try {
     const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://coindcx.com', 'Referer': 'https://coindcx.com/' }
     });
     if(r.ok) {
       const d = await r.json();
-      console.log('Funding rate API:', JSON.stringify(d));
+      console.log('Funding API:', JSON.stringify(d));
       if(d.funding_rate !== undefined) botState.fundingRate = parseFloat(d.funding_rate);
       if(d.next_funding_time) {
+        const nft = d.next_funding_time;
         let ms;
-        if(String(d.next_funding_time).length === 13) ms = d.next_funding_time - Date.now();
-        else if(String(d.next_funding_time).length === 10) ms = (d.next_funding_time * 1000) - Date.now();
-        else ms = new Date(d.next_funding_time).getTime() - Date.now();
+        if(String(nft).length === 13) ms = parseInt(nft) - Date.now();
+        else if(String(nft).length === 10) ms = parseInt(nft) * 1000 - Date.now();
+        else ms = new Date(nft).getTime() - Date.now();
         if(ms > 0 && ms < 9 * 3600 * 1000) {
-          const secs = Math.floor(ms / 1000);
-          console.log(`✅ Method 2 countdown: ${secs}s`);
-          return secs;
-        }
-      }
-    }
-  } catch(e) { console.log('Method 2 failed:', e.message); }
-
-  try {
-    const symbol = pair.replace('B-','').replace('_USDT','') + 'USDT';
-    const r = await fetch(`https://api.india.delta.exchange/v2/tickers/${symbol}`);
-    if(r.ok) {
-      const d = await r.json();
-      if(d.result && d.result.funding_rate) botState.fundingRate = parseFloat(d.result.funding_rate);
-      if(d.result && d.result.next_funding_realization) {
-        const ms = new Date(d.result.next_funding_realization).getTime() - Date.now();
-        if(ms > 0 && ms < 9 * 3600 * 1000) {
-          console.log(`✅ Delta countdown: ${Math.floor(ms/1000)}s`);
+          console.log(`✅ API countdown: ${Math.floor(ms/1000)}s`);
           return Math.floor(ms / 1000);
         }
       }
     }
-  } catch(e) { console.log('Method 3 failed:', e.message); }
+  } catch(e) { console.log('API failed:', e.message); }
 
-  console.log('⚠️ Using IST 8-hour fallback');
-  const now = new Date();
-  const istOffset = 5.5 * 3600;
-  const istSeconds = (now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds() + istOffset) % 86400;
-  const cycles = [0, 8 * 3600, 16 * 3600, 24 * 3600];
-  let left = 0;
-  for(let c of cycles) { if(c > istSeconds) { left = c - istSeconds; break; } }
-  if(left === 0) left = 86400 - istSeconds;
-  console.log(`Fallback: ${left}s`);
-  return left;
+  // Fallback: IST cycle
+  const ist = getISTCountdown();
+  console.log(`IST fallback: ${ist}s`);
+  return ist;
 }
 
+// ══════════════════════════════════════════
+// FUNDING TIME API
+// ══════════════════════════════════════════
+app.get('/funding/time', async (req, res) => {
+  const { pair } = req.query;
+  if(!pair) return res.json({ success: false, error: 'pair required' });
+  
+  // Check cache first (valid for 60 seconds)
+  const cached = fundingData[pair];
+  if(cached && (Date.now() - cached.updatedAt) < 60000) {
+    const elapsed = Math.floor((Date.now() - cached.updatedAt) / 1000);
+    const secs = Math.max(0, cached.countdown - elapsed);
+    return res.json({
+      success: true, pair,
+      countdown: secs,
+      funding_rate: cached.rate || 0.0091,
+      source: 'cache',
+      display: `${String(Math.floor(secs/3600)).padStart(2,'0')}:${String(Math.floor((secs%3600)/60)).padStart(2,'0')}:${String(secs%60).padStart(2,'0')}`
+    });
+  }
+
+  const secs = await fetchFundingCountdown(pair);
+  
+  // Update cache
+  fundingData[pair] = { countdown: secs, rate: botState.fundingRate, updatedAt: Date.now() };
+  
+  res.json({
+    success: true, pair,
+    countdown: secs,
+    funding_rate: botState.fundingRate,
+    source: 'fresh',
+    display: `${String(Math.floor(secs/3600)).padStart(2,'0')}:${String(Math.floor((secs%3600)/60)).padStart(2,'0')}:${String(secs%60).padStart(2,'0')}`
+  });
+});
+
+// ══════════════════════════════════════════
+// PLACE ORDER
+// ══════════════════════════════════════════
 async function placeOrder(side) {
   const { apiKey, apiSecret, pair, quantity, leverage } = botState;
   try {
@@ -183,15 +201,19 @@ async function placeOrder(side) {
       body
     });
     const data = await r.json();
+    console.log('Order:', JSON.stringify(data));
     if(r.ok) return { success: true, orderId: data.id };
     else return { success: false, error: data.message || 'Order failed' };
   } catch(e) { return { success: false, error: e.message }; }
 }
 
+// ══════════════════════════════════════════
+// BOT LOOP
+// ══════════════════════════════════════════
 async function startBotLoop() {
   if(botState.timer) clearInterval(botState.timer);
   botState.countdown = await fetchFundingCountdown(botState.pair);
-  addLog(`⏱ Countdown: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m ${botState.countdown%60}s`, 'info');
+  addLog(`⏱ ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m ${botState.countdown%60}s`, 'info');
 
   botState.timer = setInterval(async () => {
     if(!botState.running) { clearInterval(botState.timer); return; }
@@ -199,14 +221,14 @@ async function startBotLoop() {
 
     if(botState.countdown === 1 && !botState.orderPlacedThisCycle) {
       botState.orderPlacedThisCycle = true;
-      addLog(`⚡ 1 second! ${botState.side.toUpperCase()} order!`, 'buy');
+      addLog(`⚡ ORDER! ${botState.side.toUpperCase()}`, 'buy');
       const result = await placeOrder(botState.side);
       if(result.success) {
         botState.openPosition = { side: botState.side, quantity: botState.quantity, orderId: result.orderId, time: Date.now() };
         botState.totalTrades++;
-        addLog(`✅ Order Placed! ID: ${result.orderId}`, 'buy');
+        addLog(`✅ Placed! ID: ${result.orderId}`, 'buy');
       } else {
-        addLog(`❌ Order Failed: ${result.error}`, 'info');
+        addLog(`❌ Failed: ${result.error}`, 'info');
         botState.orderPlacedThisCycle = false;
       }
     }
@@ -216,22 +238,23 @@ async function startBotLoop() {
       addLog('💰 Funding Settled!', 'info');
       setTimeout(async () => {
         botState.countdown = await fetchFundingCountdown(botState.pair);
-        addLog(`⏱ New cycle: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m`, 'info');
+        addLog(`⏱ New: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m`, 'info');
         if(botState.openPosition) {
           const closeSide = botState.openPosition.side === 'buy' ? 'sell' : 'buy';
-          const closeResult = await placeOrder(closeSide);
-          if(closeResult.success) {
+          const r = await placeOrder(closeSide);
+          if(r.success) {
             const earned = botState.quantity * Math.abs(botState.fundingRate) * 84;
             botState.totalProfit += earned;
-            addLog(`✅ Closed! ~₹${earned.toFixed(2)} collected`, 'sell');
+            addLog(`✅ Closed! ~₹${earned.toFixed(2)}`, 'sell');
             botState.openPosition = null;
           } else {
-            addLog(`❌ Close Failed: ${closeResult.error}`, 'info');
+            addLog(`❌ Close Failed: ${r.error}`, 'info');
           }
         }
       }, 1500);
     }
 
+    // हर 5 मिनट refresh
     if(botState.countdown > 60 && botState.countdown % 300 === 0) {
       fetchFundingCountdown(botState.pair).then(c => {
         botState.countdown = c;
@@ -241,6 +264,9 @@ async function startBotLoop() {
   }, 1000);
 }
 
+// ══════════════════════════════════════════
+// SCAN
+// ══════════════════════════════════════════
 app.get('/scan', async (req, res) => {
   const ex = req.query.ex || 'coindcx';
   let results = [];
@@ -257,20 +283,31 @@ app.get('/scan', async (req, res) => {
         }
       }
     } else {
-      const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers');
+      const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://coindcx.com' }
+      });
       if(r.ok) {
         const d = await r.json();
-        if(Array.isArray(d)) {
+        if(Array.isArray(d) && d.length > 0) {
           results = d.filter(t => t.funding_rate !== undefined && t.funding_rate !== null)
-            .map(t => ({ symbol: (t.symbol||'').replace('B-','').replace('_USDT',''), pair: t.symbol, funding_rate: parseFloat(t.funding_rate), next_funding_time: t.next_funding_time || null }))
+            .map(t => ({
+              symbol: (t.symbol||'').replace('B-','').replace('_USDT',''),
+              pair: t.symbol,
+              funding_rate: parseFloat(t.funding_rate),
+              next_funding_time: t.next_funding_time || null,
+              price: t.mark_price || t.last_price || null
+            }))
             .filter(t => t.symbol && Math.abs(t.funding_rate) > 0);
         }
       }
     }
-  } catch(e) {}
+  } catch(e) { console.log('Scan error:', e.message); }
   res.json({ success: true, exchange: ex, count: results.length, results });
 });
 
+// ══════════════════════════════════════════
+// MANUAL ORDER
+// ══════════════════════════════════════════
 app.post('/order/place', async (req, res) => {
   const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
   try {
@@ -317,4 +354,4 @@ app.get('/coins', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Param Beer Shakti Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));
