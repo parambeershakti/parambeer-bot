@@ -8,9 +8,6 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders:
 app.options('*', cors());
 app.use(express.json());
 
-// ══════════════════════════════════════════
-// BOT STATE — Server Memory
-// ══════════════════════════════════════════
 let botState = {
   running: false,
   apiKey: '',
@@ -37,9 +34,6 @@ function addLog(msg, type='info') {
   console.log(`[${type}] ${msg}`);
 }
 
-// ══════════════════════════════════════════
-// HEALTH CHECK
-// ══════════════════════════════════════════
 app.get('/', (req, res) => {
   res.json({ 
     status: '✅ Param Beer Shakti Server Live!',
@@ -48,9 +42,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// ══════════════════════════════════════════
-// BOT STATUS — Browser poll karega
-// ══════════════════════════════════════════
 app.get('/bot/status', (req, res) => {
   res.json({
     running: botState.running,
@@ -66,20 +57,14 @@ app.get('/bot/status', (req, res) => {
   });
 });
 
-// ══════════════════════════════════════════
-// BOT START
-// ══════════════════════════════════════════
 app.post('/bot/start', async (req, res) => {
   const { apiKey, apiSecret, pair, side, quantity, leverage, exchange } = req.body;
-  
   if(!apiKey || !apiSecret || !pair || !side || !quantity) {
     return res.json({ success: false, error: 'Missing fields' });
   }
-  
   if(botState.running) {
     return res.json({ success: false, error: 'Bot already running!' });
   }
-
   botState.apiKey = apiKey;
   botState.apiSecret = apiSecret;
   botState.pair = pair;
@@ -89,18 +74,11 @@ app.post('/bot/start', async (req, res) => {
   botState.exchange = exchange || 'coindcx';
   botState.running = true;
   botState.orderPlacedThisCycle = false;
-
   addLog(`🟢 Server Bot Started! ${pair} | ${side.toUpperCase()} | ${exchange}`, 'info');
-  
-  // Start the countdown loop
   startBotLoop();
-  
-  res.json({ success: true, message: 'Bot started on server! Browser बंद करो — server चलाएगा!' });
+  res.json({ success: true, message: 'Bot started!' });
 });
 
-// ══════════════════════════════════════════
-// BOT STOP
-// ══════════════════════════════════════════
 app.post('/bot/stop', (req, res) => {
   botState.running = false;
   if(botState.timer) { clearInterval(botState.timer); botState.timer = null; }
@@ -108,81 +86,91 @@ app.post('/bot/stop', (req, res) => {
   res.json({ success: true, message: 'Bot stopped' });
 });
 
-// ══════════════════════════════════════════
-// FUNDING TIME FETCH — Coin specific
-// ══════════════════════════════════════════
 async function fetchFundingCountdown(pair) {
-  console.log(`Fetching funding time for pair: ${pair}`);
+  console.log(`Fetching funding time for: ${pair}`);
 
-  // Method 1: CoinDCX exact funding API
   try {
-    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`, {
+    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
     });
     if(r.ok) {
       const d = await r.json();
-      console.log('Funding API response:', JSON.stringify(d));
-      if(d.funding_rate !== undefined) botState.fundingRate = parseFloat(d.funding_rate);
-      if(d.next_funding_time) {
-        const ms = new Date(d.next_funding_time).getTime() - Date.now();
-        if(ms > 0) {
-          console.log(`✅ Live countdown from API: ${Math.floor(ms/1000)} seconds`);
-          return Math.floor(ms / 1000);
+      if(Array.isArray(d)) {
+        const ticker = d.find(t => 
+          t.symbol === pair || 
+          t.market === pair || 
+          t.symbol === pair.replace('B-','') ||
+          t.market === pair.replace('B-','')
+        );
+        console.log('Ticker:', JSON.stringify(ticker));
+        if(ticker) {
+          if(ticker.funding_rate) botState.fundingRate = parseFloat(ticker.funding_rate);
+          if(ticker.next_funding_time) {
+            let ms;
+            if(String(ticker.next_funding_time).length === 13) ms = ticker.next_funding_time - Date.now();
+            else if(String(ticker.next_funding_time).length === 10) ms = (ticker.next_funding_time * 1000) - Date.now();
+            else ms = new Date(ticker.next_funding_time).getTime() - Date.now();
+            if(ms > 0 && ms < 9 * 3600 * 1000) {
+              const secs = Math.floor(ms / 1000);
+              console.log(`✅ Live countdown: ${secs}s`);
+              return secs;
+            }
+          }
         }
       }
     }
   } catch(e) { console.log('Method 1 failed:', e.message); }
 
-  // Method 2: Futures tickers
   try {
-    const r = await fetch('https://api.coindcx.com/exchange/v1/derivatives/tickers', {
+    const r = await fetch(`https://api.coindcx.com/exchange/v1/derivatives/funding_rate?pair=${pair}`, {
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
     if(r.ok) {
       const d = await r.json();
-      const ticker = Array.isArray(d) ? d.find(t => t.symbol === pair || t.market === pair) : null;
-      console.log('Ticker found:', JSON.stringify(ticker));
-      if(ticker) {
-        if(ticker.funding_rate) botState.fundingRate = parseFloat(ticker.funding_rate);
-        if(ticker.next_funding_time) {
-          const ms = new Date(ticker.next_funding_time).getTime() - Date.now();
-          if(ms > 0) {
-            console.log(`✅ Live countdown from ticker: ${Math.floor(ms/1000)} seconds`);
-            return Math.floor(ms / 1000);
-          }
+      console.log('Funding rate API:', JSON.stringify(d));
+      if(d.funding_rate !== undefined) botState.fundingRate = parseFloat(d.funding_rate);
+      if(d.next_funding_time) {
+        let ms;
+        if(String(d.next_funding_time).length === 13) ms = d.next_funding_time - Date.now();
+        else if(String(d.next_funding_time).length === 10) ms = (d.next_funding_time * 1000) - Date.now();
+        else ms = new Date(d.next_funding_time).getTime() - Date.now();
+        if(ms > 0 && ms < 9 * 3600 * 1000) {
+          const secs = Math.floor(ms / 1000);
+          console.log(`✅ Method 2 countdown: ${secs}s`);
+          return secs;
         }
       }
     }
   } catch(e) { console.log('Method 2 failed:', e.message); }
 
-  // Method 3: Public ticker
   try {
-    const r = await fetch('https://public.coindcx.com/exchange/ticker');
+    const symbol = pair.replace('B-','').replace('_USDT','') + 'USDT';
+    const r = await fetch(`https://api.india.delta.exchange/v2/tickers/${symbol}`);
     if(r.ok) {
       const d = await r.json();
-      const t = d.find(x => x.market === pair);
-      if(t && t.next_funding_time) {
-        const ms = new Date(t.next_funding_time).getTime() - Date.now();
-        if(ms > 0) return Math.floor(ms/1000);
+      if(d.result && d.result.funding_rate) botState.fundingRate = parseFloat(d.result.funding_rate);
+      if(d.result && d.result.next_funding_realization) {
+        const ms = new Date(d.result.next_funding_realization).getTime() - Date.now();
+        if(ms > 0 && ms < 9 * 3600 * 1000) {
+          console.log(`✅ Delta countdown: ${Math.floor(ms/1000)}s`);
+          return Math.floor(ms / 1000);
+        }
       }
     }
-  } catch(e) {}
+  } catch(e) { console.log('Method 3 failed:', e.message); }
 
-  // Fallback: UTC 8-hour cycle
-  console.log('Using UTC 8-hour fallback');
+  console.log('⚠️ Using IST 8-hour fallback');
   const now = new Date();
-  const s = now.getUTCHours()*3600 + now.getUTCMinutes()*60 + now.getUTCSeconds();
-  const cycles = [0, 8*3600, 16*3600, 24*3600];
+  const istOffset = 5.5 * 3600;
+  const istSeconds = (now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds() + istOffset) % 86400;
+  const cycles = [0, 8 * 3600, 16 * 3600, 24 * 3600];
   let left = 0;
-  for(let c of cycles) { if(c > s) { left = c - s; break; } }
-  if(left === 0) left = 24*3600 - s;
-  console.log(`Fallback countdown: ${left} seconds`);
+  for(let c of cycles) { if(c > istSeconds) { left = c - istSeconds; break; } }
+  if(left === 0) left = 86400 - istSeconds;
+  console.log(`Fallback: ${left}s`);
   return left;
 }
 
-// ══════════════════════════════════════════
-// PLACE ORDER
-// ══════════════════════════════════════════
 async function placeOrder(side) {
   const { apiKey, apiSecret, pair, quantity, leverage } = botState;
   try {
@@ -200,79 +188,62 @@ async function placeOrder(side) {
   } catch(e) { return { success: false, error: e.message }; }
 }
 
-// ══════════════════════════════════════════
-// BOT LOOP — Server पर चलेगा
-// ══════════════════════════════════════════
 async function startBotLoop() {
   if(botState.timer) clearInterval(botState.timer);
-
-  // First fetch countdown
   botState.countdown = await fetchFundingCountdown(botState.pair);
-  addLog(`⏱ Countdown: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m`, 'info');
+  addLog(`⏱ Countdown: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m ${botState.countdown%60}s`, 'info');
 
   botState.timer = setInterval(async () => {
     if(!botState.running) { clearInterval(botState.timer); return; }
-
     botState.countdown--;
 
-    // ⚡ 1 SECOND बचा → ORDER PLACE
     if(botState.countdown === 1 && !botState.orderPlacedThisCycle) {
       botState.orderPlacedThisCycle = true;
-      addLog(`⚡ 1 second! ${botState.side.toUpperCase()} order place हो रहा है...`, 'buy');
-      
+      addLog(`⚡ 1 second! ${botState.side.toUpperCase()} order!`, 'buy');
       const result = await placeOrder(botState.side);
-      
       if(result.success) {
         botState.openPosition = { side: botState.side, quantity: botState.quantity, orderId: result.orderId, time: Date.now() };
         botState.totalTrades++;
-        addLog(`✅ Order Placed! ID: ${result.orderId} | ${botState.pair}`, 'buy');
+        addLog(`✅ Order Placed! ID: ${result.orderId}`, 'buy');
       } else {
         addLog(`❌ Order Failed: ${result.error}`, 'info');
         botState.orderPlacedThisCycle = false;
       }
     }
 
-    // 🔄 FUNDING SETTLE → NEW CYCLE → CLOSE
     if(botState.countdown <= 0) {
       botState.orderPlacedThisCycle = false;
-      addLog('💰 Funding Settled! 1 second बाद close होगा...', 'info');
-      
-      // Refetch countdown for new cycle
+      addLog('💰 Funding Settled!', 'info');
       setTimeout(async () => {
         botState.countdown = await fetchFundingCountdown(botState.pair);
-        
-        // Close position
+        addLog(`⏱ New cycle: ${Math.floor(botState.countdown/3600)}h ${Math.floor((botState.countdown%3600)/60)}m`, 'info');
         if(botState.openPosition) {
           const closeSide = botState.openPosition.side === 'buy' ? 'sell' : 'buy';
           const closeResult = await placeOrder(closeSide);
-          
           if(closeResult.success) {
             const earned = botState.quantity * Math.abs(botState.fundingRate) * 84;
             botState.totalProfit += earned;
-            addLog(`✅ Position Closed! ~₹${earned.toFixed(2)} funding collected`, 'sell');
+            addLog(`✅ Closed! ~₹${earned.toFixed(2)} collected`, 'sell');
             botState.openPosition = null;
           } else {
-            addLog(`❌ Close Failed: ${closeResult.error} — CoinDCX पर manually close करें!`, 'info');
+            addLog(`❌ Close Failed: ${closeResult.error}`, 'info');
           }
         }
-      }, 1000);
+      }, 1500);
     }
 
-    // Refresh countdown every 5 minutes from API
-    if(botState.countdown % 300 === 0 && botState.countdown > 60) {
-      fetchFundingCountdown(botState.pair).then(c => { botState.countdown = c; });
+    if(botState.countdown > 60 && botState.countdown % 300 === 0) {
+      fetchFundingCountdown(botState.pair).then(c => {
+        botState.countdown = c;
+        addLog(`🔄 Refreshed: ${Math.floor(c/3600)}h ${Math.floor((c%3600)/60)}m`, 'info');
+      });
     }
-
   }, 1000);
 }
 
-// ══════════════════════════════════════════
-// SCAN
-// ══════════════════════════════════════════
 app.get('/scan', async (req, res) => {
   const ex = req.query.ex || 'coindcx';
   let results = [];
-  
   try {
     if(ex === 'delta') {
       const r = await fetch('https://api.india.delta.exchange/v2/tickers?contract_types=perpetual_futures');
@@ -281,7 +252,7 @@ app.get('/scan', async (req, res) => {
         if(d.success && d.result) {
           results = d.result
             .filter(t => t.funding_rate !== undefined && t.funding_rate !== null)
-            .map(t => ({ symbol: t.underlying_asset_symbol || '', pair: t.symbol, funding_rate: parseFloat(t.funding_rate), price: t.mark_price }))
+            .map(t => ({ symbol: t.underlying_asset_symbol||'', pair: t.symbol, funding_rate: parseFloat(t.funding_rate), price: t.mark_price }))
             .filter(t => t.symbol && Math.abs(t.funding_rate) > 0);
         }
       }
@@ -291,19 +262,15 @@ app.get('/scan', async (req, res) => {
         const d = await r.json();
         if(Array.isArray(d)) {
           results = d.filter(t => t.funding_rate !== undefined && t.funding_rate !== null)
-            .map(t => ({ symbol: (t.symbol||'').replace('B-','').replace('_USDT',''), pair: t.symbol, funding_rate: parseFloat(t.funding_rate) }))
+            .map(t => ({ symbol: (t.symbol||'').replace('B-','').replace('_USDT',''), pair: t.symbol, funding_rate: parseFloat(t.funding_rate), next_funding_time: t.next_funding_time || null }))
             .filter(t => t.symbol && Math.abs(t.funding_rate) > 0);
         }
       }
     }
   } catch(e) {}
-
   res.json({ success: true, exchange: ex, count: results.length, results });
 });
 
-// ══════════════════════════════════════════
-// MANUAL ORDER (Browser से)
-// ══════════════════════════════════════════
 app.post('/order/place', async (req, res) => {
   const { apiKey, apiSecret, pair, side, quantity, leverage } = req.body;
   try {
