@@ -4,8 +4,7 @@
   "description": "Param Beer Shakti CoinDCX Funding Bot Server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js & node telegram-bot.js",
   },
   "engines": {
     "node": ">=18.0.0"
